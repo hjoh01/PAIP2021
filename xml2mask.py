@@ -1,101 +1,103 @@
+# Pubilc
 import cv2
-import glob
 import numpy as np
-import openslide
 import os
-import re
-import xml.etree.ElementTree as ET
-from tqdm import tqdm
-from skimage import io
+from pathlib import Path
+from skimage.morphology import remove_small_holes, remove_small_objects
+from tqdm import tqdm, trange
+from xml.etree.ElementTree import Element, ElementTree, SubElement
 
-def xml2mask(xml_fn, slide, level):
-    """
-    <XML Tree>
-    Annotations (root)
-    > Annotation
-      > Regions
-        > Region
-          > Vertices
-            > Vertex
-              > X, Y
+def indent(elem, level=0): #자료 출처 https://goo.gl/J8VoDK
+    i = "\n" + level*"  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for elem in elem:
+            indent(elem, level+1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
 
-    <Label>
-    nerve_without_tumor (contour): 1
-    perineural_invasion_junction (line): 2
-    nerve_without_tumor (bounding box): 11
-    tumor_without_nerve (bounding box): 13
-    nontumor_without_nerve (bounding box): 14
-    """
+def mask2xml(
+    mask: np.ndarray,
+    ) -> ElementTree:
+    
+    # Annotations
+    annotations = Element("Annotations")
 
-    etree = ET.parse(xml_fn)
+    ## Annotation
+    annotation = SubElement(annotations, "Annotation")
+    annotation.set("Id", "1")
+    annotation.set("Name", "Prostate Prediction")
 
-    # Height and Width Ratio
-    src_w, src_h  = slide.level_dimensions[0]
-    dest_w, dest_h = slide.level_dimensions[level]
-    w_ratio = src_w / dest_w
-    h_ratio = src_h / dest_h
+    ### Region
+    regions = SubElement(annotation, "Regions")
 
-    mask = np.zeros((dest_h, dest_w))
+    ### Reshape mask from level1 to level0
+    # mask = np.kron(mask, np.ones((4,4)))
 
-    annotations = etree.getroot()
-    for annotation in annotations:
-        label = int(annotation.get("Id"))
+    #### Region
+    mask = mask.astype(np.uint8)
+    print("Computing connected components")
+    labels, connected_component_map = cv2.connectedComponents(mask, connectivity=8, )
 
-        cntr_pts = list()
-        bbox_pts = list()
+    print(connected_component_map.shape)
+    cv2.imwrite(str(Path(xml_save_dir) / f"{filename}.tif"), connected_component_map.astype(np.uint8))
 
-        regions = annotation.findall("Regions")[0]
-        for region in regions.findall("Region"):
-            pts = list()
+    print("Converting to XML")
+    for n in trange(1, labels): # Exclude background label
+        region = Element("Region", Id=str(n))
 
-            vertices = region.findall("Vertices")[0]
-            for vertex in vertices.findall("Vertex"):
-                x = round(float(vertex.get("X")))
-                y = round(float(vertex.get("Y")))
+        n_mask = (connected_component_map == n).astype(np.uint8)
+        contours, hierarchy = cv2.findContours(n_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE) # cv2.CHAIN_APPROX_NONE
 
-                # Match target level coordinates
-                x = np.clip(round(x / w_ratio), 0, dest_w)
-                y = np.clip(round(y / h_ratio), 0, dest_h)
+        # print(len(contours), len(contours[1]))
 
-                pts.append((x, y))
+        for contour in tqdm(contours, leave=False):
+            vertices = Element("Vertices")
+            for pt in tqdm(contour, leave=False):
+                x, y = pt[0][0], pt[0][1]
+                vertex = Element("Vertex", X=str(4*x), Y=str(4*y), Z="0")
+                vertices.append(vertex)
 
-            if len(pts) == 4:
-                bbox_pts += [pts]
-            else:
-                cntr_pts += [pts]
+        region.append(vertices)
+        regions.append(region)
 
-        # Bounding box
-        for pts in bbox_pts:
-            pts = [np.array(pts, dtype=np.int32)]
-            mask = cv2.drawContours(mask, pts, -1, label + 10, -1)
-        for pts in cntr_pts:
-            pts = [np.array(pts, dtype=np.int32)]
-            # Curved line
-            if label == 2:
-                mask = cv2.polylines(mask, pts, isClosed=False, color=label, thickness=1)
-            # Contour
-            else:
-                mask = cv2.drawContours(mask, pts, -1, label, -1)
+    mask_xml = annotations
+
+    return mask_xml
+
+def remove_noise(mask, min_output_size=8192):
+    # Remove small lines
+    mask = mask > 0
+    mask = remove_small_holes(mask, min_output_size, connectivity=8)
+    mask = remove_small_objects(mask, min_output_size, connectivity=8)
+    mask = (mask > 0).astype(np.uint8)
     return mask
 
 if __name__ == "__main__":
-    svs_load_dir = "./svs_folder/"
-    xml_load_dir = "./xml_folder/"
-    xml_fns = sorted(glob.glob(xml_load_dir + "*.xml") + glob.glob(xml_load_dir + "*.XML"))
-    level = 2
+    xml_save_dir = "./save_xml/"
+    os.makedirs(xml_save_dir, exist_ok=True)
 
-    mask_save_dir = f"./mask_img_l{level}/"
-    os.makedirs(mask_save_dir, exist_ok=True)
+    filename = "prostate_0001"
+    # sample_mask_filepath = f"/storage_2/prostate_data/predicted_mask/{filename}.png"
+    
+    print("Reading image")
+    sample_mask = cv2.imread(sample_mask_filepath)
+    sample_mask = cv2.cvtColor(sample_mask, cv2.COLOR_RGB2GRAY)
+    sample_mask = (sample_mask > 0).astype(np.uint8)
 
-    wsi_uid_pattern = "[a-zA-Z]*_PNI2021chall_train_[0-9]{4}"
-    wsi_regex = re.compile(wsi_uid_pattern)
+    print("Removing noisy objects")
+    sample_mask = remove_noise(sample_mask)
 
-    for xml_fn in tqdm(xml_fns):
-        wsi_uid = wsi_regex.findall(xml_fn)[0]
+    sample_xml = mask2xml(sample_mask)
 
-        slide = openslide.OpenSlide(svs_load_dir + wsi_uid + ".svs")
+    print("Saving image")
+    indent(sample_xml)
+    ElementTree(sample_xml).write(Path(xml_save_dir) / f"{filename}.xml")
 
-        mask = xml2mask(xml_fn, slide, level)
-
-        save_name = f"{wsi_uid}_l{level}_mask.tif"
-        io.imsave(mask_save_dir + save_name, mask.astype(np.uint8), check_contrast=False)
+    print("Done")
